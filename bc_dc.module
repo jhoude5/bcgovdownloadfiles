@@ -1,0 +1,333 @@
+<?php
+
+/**
+ * @file
+ * Module file.
+ */
+
+use Drupal\bc_dc\Controller\BcDcCreateFileController;
+use Drupal\Core\Entity\EntityInterface;
+use Drupal\Core\Entity\FieldableEntityInterface;
+use Drupal\Core\Form\FormStateInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Render\Element;
+use Drupal\message_gcnotify\Service\GcNotifyApiService;
+use Drupal\node\NodeInterface;
+use Drupal\taxonomy\TermInterface;
+use Drupal\views\ViewExecutable;
+
+/**
+ * Implements hook_theme().
+ */
+function bc_dc_theme(array $existing, string $type, string $theme, string $path): array {
+  return [
+    'bc_dc_row_mb3' => [
+      'variables' => [
+        'classes' => NULL,
+        'content' => NULL,
+      ],
+    ],
+  ];
+}
+
+/**
+ * Implements hook_preprocess_HOOK().
+ */
+function bc_dc_preprocess_flag(array &$variables): void {
+  // Replace @title with improved @aria-label.
+  unset($variables['attributes']['title']);
+  $title = $variables['flaggable']->getTitle();
+  $variables['attributes']['aria-label'] = $variables['action'] === 'flag' ?
+    t('Not bookmarked; add bookmark for "@title".', ['@title' => $title]) :
+    t('Bookmarked; remove bookmark for "@title".', ['@title' => $title]);
+
+  // Bookmark count message.
+  // If at least one user has bookmarked an item, add a message with the count.
+  $node_bookmark_count = bc_dc_count_node_bookmarks($variables['flaggable']);
+  if ($node_bookmark_count > 0) {
+    $args = [
+      '@count' => $node_bookmark_count,
+    ];
+    $count_message = \Drupal::translation()->formatPlural($node_bookmark_count, 'Bookmarked by 1 person', 'Bookmarked by @count people', $args);
+    $variables['title']['#markup'] = '<span class="title dc-label icon-bi-bookmark-dash-fill">' . $variables['title']['#markup'] . '</span> <span class="count small">' . $count_message->render() . '</span>';
+  }
+}
+
+/**
+ * Return the number of bookmarks on a given entity.
+ *
+ * @param \Drupal\Core\Entity\EntityInterface $entity
+ *   The entity to count on.
+ *
+ * @return int
+ *   The number of bookmarks on the given entity.
+ */
+function bc_dc_count_node_bookmarks(EntityInterface $entity): int {
+  $count = \Drupal::service('flag.count')->getEntityFlagCounts($entity);
+  return isset($count['bookmark']) ? ((int) $count['bookmark']) : 0;
+}
+
+/**
+ * Implements hook_entity_display_build_alter().
+ *
+ * Based on hook implementation in empty_fields module.
+ */
+function bc_dc_entity_display_build_alter(array &$build, array $context): void {
+  // Act only on build page view modes. Return early otherwise.
+  $view_modes = [
+    'data_set_build_page',
+    'data_set_columns',
+  ];
+  if (!in_array($context['view_mode'], $view_modes, TRUE)) {
+    return;
+  }
+
+  /** @var \Drupal\Core\Entity\EntityInterface $entity */
+  $entity = $context['entity'];
+  /** @var \Drupal\Core\Entity\Display\EntityViewDisplayInterface $display */
+  $display = $context['display'];
+  foreach (Element::children($build) as $field_name) {
+    if ($entity->get($field_name)->isEmpty()) {
+      $definition = $entity->get($field_name)->getFieldDefinition();
+      $component = $display->getComponent($field_name);
+
+      $empty_text = match($field_name) {
+        'field_last_review_date' => t('Never'),
+        default => $definition->isRequired() ? t('Required') : t('Optional'),
+      };
+      $markup = ['#markup' => '<em>' . $empty_text . '</em>'];
+
+      $build[$field_name] = [
+        '#theme' => 'field',
+        '#title' => $definition->getLabel(),
+        '#label_display' => $component['label'],
+        '#view_mode' => $context['view_mode'],
+        '#language' => $entity->get($field_name)->getLangcode(),
+        '#field_name' => $definition->getName(),
+        '#field_type' => 'string',
+        '#field_translatable' => $definition->isTranslatable(),
+        '#entity_type' => $entity->getEntityTypeId(),
+        '#bundle' => $entity->bundle(),
+        '#object' => $entity,
+        '#items' => [(object) ['_attributes' => []]],
+        '#is_multiple' => FALSE,
+        // Use simple formatter.
+        '#formatter' => 'string',
+        '0' => $markup,
+      ] + $build[$field_name];
+    }
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function bc_dc_node_presave(NodeInterface $entity): void {
+  // Act only on data_set nodes.
+  if ($entity->bundle() !== 'data_set') {
+    return;
+  }
+
+  // When is_complete_review is checked, set field_last_review_date to now.
+  if ($entity->get('field_is_complete_review')->value) {
+    $entity->set('field_last_review_date', date('Y-m-d'));
+    $entity->set('field_is_complete_review', FALSE);
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_update() for node.
+ */
+function bc_dc_node_update(NodeInterface $entity): void {
+  // Send a notification to all users who have bookmarked this data_set and who
+  // last viewed it before the modified_date.
+  //
+  // Act only on data_set nodes.
+  if ($entity->bundle() !== 'data_set') {
+    return;
+  }
+
+  // If field_modified_date is not made greater than it was, do nothing.
+  $old_modified_date = $entity->original->field_modified_date->value;
+  $new_modified_date = $entity->field_modified_date->value;
+  if ($new_modified_date <= $old_modified_date) {
+    return;
+  }
+
+  // Load an array of all bookmarks.
+  $flag_service = \Drupal::service('flag');
+  $bookmark_flag = $flag_service->getFlagById('bookmark');
+  /** @var \Drupal\flag\FlaggingInterface[] $bookmark_flaggings Array of flaggings. */
+  $bookmark_flaggings = $flag_service->getEntityFlaggings($bookmark_flag, $entity);
+
+  // Create an array of users who need to be notified of the change.
+  /** @var string[] $send_to Array of email addresses. */
+  $send_to = [];
+  // Add to the list if the data set was modified after the last viewed date.
+  // We compare dates because field_modified_date might not be set to now, but
+  // some time in the past when it was know that an update was made.
+  foreach ($bookmark_flaggings as $bookmark_flagging) {
+    if ($new_modified_date > $bookmark_flagging->get('field_last_viewed_date')->value) {
+      $email = $bookmark_flagging->getOwner()->getEmail();
+      if ($email) {
+        $send_to[] = $email;
+      }
+    }
+  }
+
+  // No recipients.
+  if (!$send_to) {
+    $context = [
+      '@nid' => $entity->id(),
+    ];
+    \Drupal::logger('bc_dc')->notice('No messages to send when updating data_set @nid.', $context);
+    return;
+  }
+
+  // Send the notifications.
+  //
+  // Message subject.
+  $subject = t('A dataset you have bookmarked has been updated');
+  // Message body.
+  $context = [
+    '@title' => $entity->getTitle(),
+    '@link' => $entity->toUrl('canonical', ['absolute' => TRUE])->toString(),
+  ];
+  $body = t('The following dataset has been updated:
+@title
+@link', $context);
+  // Send the message and log the result.
+  $success = GcNotifyApiService::sendMessage($send_to, $subject, $body);
+  if ($success) {
+    $context = [
+      '@count' => count($send_to),
+      '@nid' => $entity->id(),
+    ];
+    \Drupal::logger('bc_dc')->notice('Sent message to @count users when updating data_set @nid.', $context);
+  }
+  else {
+    $context = [
+      '@nid' => $entity->id(),
+    ];
+    \Drupal::logger('bc_dc')->error('Failed sending message when updating data_set @nid.', $context);
+  }
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function bc_dc_form_node_data_set_edit_form_alter(array &$form, FormStateInterface $form_state, string $form_id): void {
+  // Remove the "Edit all" button.
+  $form['field_columns']['widget']['header_actions']['actions']['edit_all']['#access'] = FALSE;
+  // Remove the "Collapse all" action.
+  $form['field_columns']['widget']['header_actions']['dropdown_actions']['collapse_all']['#access'] = FALSE;
+
+  // Disable if no review interval is set.
+  if (isset($form['field_is_complete_review'])) {
+    $form['field_is_complete_review']['#states']['disabled'][':input[id="edit-field-review-interval-0-value"]'] = ['empty' => TRUE];
+  }
+}
+
+/**
+ * Implements hook_ENTITY_TYPE_presave().
+ */
+function bc_dc_taxonomy_term_presave(TermInterface $term): void {
+  // Only act on information_schedule terms.
+  if ($term->bundle() !== 'information_schedule') {
+    return;
+  }
+
+  // Set the value for field_schedule_code.
+  // If this item's own field_schedule_number is empty, use empty. Otherwise,
+  // combine with the non-empty values from the ancestor terms.
+  if ((string) $term->field_schedule_number->value === '') {
+    $new_code = NULL;
+  }
+  else {
+    // Start with code of current term.
+    $new_code = [$term->field_schedule_number->value];
+    // Add the codes of ancestor terms.
+    $term_parents = \Drupal::entityTypeManager()->getStorage('taxonomy_term')->loadAllParents($term->parent->target_id);
+    foreach ($term_parents as $term_parent) {
+      $term_parent_number = (string) $term_parent->field_schedule_number->value;
+      if ($term_parent_number !== '') {
+        $new_code[] = $term_parent_number;
+      }
+    }
+    // ::loadAllParents() gives them in reverse order to what we want.
+    $new_code = implode('-', array_reverse($new_code));
+  }
+  // Update code if it has changed.
+  if ($new_code !== $term->field_schedule_code->value) {
+    $term->set('field_schedule_code', $new_code);
+  }
+}
+
+/**
+ * Implements hook_cron().
+ */
+function bc_dc_cron(): void {
+  // Limit to running once a day.
+  $request_time = \Drupal::time()->getRequestTime();
+  $cron_last_run = \Drupal::state()->get('bc_dc.cron_last_run', 0);
+  if (date('Y-m-d', $request_time) === date('Y-m-d', $cron_last_run)) {
+    return;
+  }
+  // Record that this function has run.
+  \Drupal::state()->set('bc_dc.cron_last_run', $request_time);
+
+  // Send review reminders.
+  $reviewReminder = \Drupal::service('bc_dc.review_reminder');
+  $reviewReminder->sendRemindersToAllUsers();
+}
+
+/**
+ * Implements hook_form_FORM_ID_alter().
+ */
+function bc_dc_form_bc_dc_add_columns_form_alter(array &$form, FormStateInterface $form_state, string $form_id): void {
+  $nid = $form_state->get('nid');
+  $entity = \Drupal::entityTypeManager()->getStorage('node')->load($nid);
+  $data_dictionary_download_links = bc_dc_get_data_dictionary_download_links($entity);
+  if ($data_dictionary_download_links) {
+    $form['data_dictionary'] = $data_dictionary_download_links;
+    $form['data_dictionary']['#weight'] = 0;
+  }
+}
+
+/**
+ * Return a renderable list of links to download column import files.
+ *
+ * @param \Drupal\Core\Entity\FieldableEntityInterface $entity
+ *   The entity.
+ *
+ * @return array|null
+ *   A Drupal render array or NULL if there are no columns.
+ */
+function bc_dc_get_data_dictionary_download_links(FieldableEntityInterface $entity): ?array {
+  if (!$entity->get('field_columns')->referencedEntities()) {
+    return NULL;
+  }
+
+  $items = [];
+  foreach (BcDcCreateFileController::SUPPORTED_EXTENSIONS as $format) {
+    $items[] = Link::createFromRoute(
+      t('Download current data dictionary file to @format', ['@format' => strtoupper($format)]),
+      'bc_dc.create_columns_file',
+      ['node' => $entity->id(), 'format' => $format],
+    );
+  }
+  return [
+    '#theme' => 'item_list',
+    '#items' => $items,
+  ];
+}
+
+/**
+ * Implements hook_views_pre_build().
+ */
+function bc_dc_views_pre_build(ViewExecutable $view): void {
+  // Hide vbo_export on search pages for anonymous users.
+  if ($view->id() === 'site_search' && \Drupal::currentUser()->isAnonymous()) {
+    unset($view->field['views_bulk_operations_bulk_form']);
+  }
+}
